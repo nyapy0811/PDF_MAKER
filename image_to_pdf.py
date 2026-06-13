@@ -7,6 +7,7 @@
 """
 
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,9 +25,30 @@ DEFAULT_SAVE_DIR = r"G:\tokki"
 DEFAULT_OPEN_DIR = r"G:\만화"
 
 _SCRIPT_DIR = Path(__file__).parent
-ESRGAN_EXE  = _SCRIPT_DIR / "realesrgan-ncnn-vulkan.exe"
+MODELS_DIR = _SCRIPT_DIR / "models"
+
+
+def _find_exe():
+    # upscayl-bin(최신 ncnn 빌드)이 있으면 우선 사용, 없으면 기존 exe
+    for name in ("upscayl-bin.exe", "realesrgan-ncnn-vulkan.exe"):
+        p = _SCRIPT_DIR / name
+        if p.exists():
+            return p
+    return _SCRIPT_DIR / "realesrgan-ncnn-vulkan.exe"
+
+
+ESRGAN_EXE = _find_exe()
+# upscayl-bin은 옵션 체계가 다름: -s=출력배율, -z=모델배율, GPU 목록은 -v 필요
+IS_UPSCAYL = ESRGAN_EXE.name.lower() == "upscayl-bin.exe"
 
 ESRGAN_MODELS = ["realesrgan-x4plus-anime", "realesrgan-x4plus", "realesr-animevideov3"]
+
+# 모델별 지원 배율 (x4plus 계열은 4배 전용)
+MODEL_SCALES = {
+    "realesrgan-x4plus-anime": [4],
+    "realesrgan-x4plus": [4],
+    "realesr-animevideov3": [2, 3, 4],
+}
 
 
 def images_to_pdf(image_paths, output_path):
@@ -39,11 +61,49 @@ def images_to_pdf(image_paths, output_path):
     imgs[0].save(output_path, save_all=True, append_images=imgs[1:])
 
 
+def list_gpus():
+    """exe를 짧게 실행해 사용 가능한 GPU 목록을 파싱한다. [(번호, 이름), ...]"""
+    if not ESRGAN_EXE.exists():
+        return []
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tin = Path(td) / "probe.png"
+            tout = Path(td) / "probe_out.png"
+            Image.new("RGB", (4, 4), (128, 128, 128)).save(tin)
+            cmd = [str(ESRGAN_EXE), "-i", str(tin), "-o", str(tout),
+                   "-m", str(MODELS_DIR), "-n", "realesr-animevideov3", "-s", "2"]
+            if IS_UPSCAYL:
+                cmd += ["-z", "2", "-v"]
+            proc = subprocess.run(cmd, capture_output=True,
+                                  encoding="utf-8", errors="ignore",
+                                  creationflags=flags, timeout=30)
+            text = (proc.stderr or "") + (proc.stdout or "")
+    except Exception:
+        return []
+    gpus = {}
+    for line in text.splitlines():
+        m = re.match(r"\[(\d+)\s+([^\]]+)\]", line.strip())
+        if m:
+            gpus[int(m.group(1))] = m.group(2).strip()
+    return sorted(gpus.items())
+
+
+def default_gpu(gpus):
+    """외장 GPU(NVIDIA/AMD)를 우선 선택, 없으면 첫 번째."""
+    for num, name in gpus:
+        if any(k in name for k in ("NVIDIA", "GeForce", "RTX", "AMD", "Radeon")):
+            return num
+    return gpus[0][0] if gpus else None
+
+
 def _esrgan_run(src_dir, dst_dir, scale, model, tile, gpu, progress_cb, total):
     for p in dst_dir.glob("*.png"):
         p.unlink()
     cmd = [str(ESRGAN_EXE), "-i", str(src_dir), "-o", str(dst_dir),
-           "-n", model, "-s", str(scale), "-f", "png", "-t", str(tile)]
+           "-m", str(MODELS_DIR), "-n", model, "-s", str(scale), "-f", "png", "-t", str(tile)]
+    if IS_UPSCAYL:
+        cmd += ["-z", str(scale)]  # upscayl: 모델 배율 명시
     if gpu is not None:
         cmd += ["-g", str(gpu)]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -63,22 +123,25 @@ def _esrgan_run(src_dir, dst_dir, scale, model, tile, gpu, progress_cb, total):
         raise RuntimeError(err or "업스케일 실패")
 
 
-def _outputs_black(dst_dir):
-    """결과 PNG 중 하나라도 완전히 검으면(픽셀 최대값 0) 실패로 판단."""
+def _count_black(dst_dir):
+    """완전히 검은(픽셀 최대값 0) PNG 수를 센다. (검은 수, 전체 수) 반환.
+    만화엔 정상적으로 새까만 페이지가 있을 수 있으므로, '전부' 검을 때만 실패로 본다."""
     pngs = [p for p in dst_dir.iterdir() if p.suffix.lower() == ".png"]
     if not pngs:
-        return True
+        return (0, 0)
+    black = 0
     for p in pngs:
         try:
             ex = Image.open(p).convert("RGB").getextrema()
         except Exception:
-            return True
+            black += 1
+            continue
         if max(hi for _, hi in ex) == 0:
-            return True
-    return False
+            black += 1
+    return (black, len(pngs))
 
 
-def upscale_folder(src_dir, dst_dir, scale, model, tile=0, progress_cb=None, status_cb=None):
+def upscale_folder(src_dir, dst_dir, scale, model, tile=0, progress_cb=None, status_cb=None, gpus=None):
     if not ESRGAN_EXE.exists():
         raise FileNotFoundError(
             "realesrgan-ncnn-vulkan.exe 를 찾을 수 없습니다.\n"
@@ -88,25 +151,22 @@ def upscale_folder(src_dir, dst_dir, scale, model, tile=0, progress_cb=None, sta
     dst_dir.mkdir(parents=True, exist_ok=True)
     total = len([p for p in src_dir.iterdir() if p.suffix.lower() in SUPPORTED])
 
-    # 재시도 순서: (요청 타일) → 절반씩 줄이기(>=32) → CPU 모드
-    attempts = []
-    if tile > 0:
-        t = tile
-        while t >= 32:
-            attempts.append((t, None))
-            t //= 2
-    else:
-        attempts.append((0, None))
-    attempts.append((attempts[-1][0], -1))  # 마지막: CPU 폴백
+    if not gpus:
+        gpus = [None]
 
-    for i, (t, gpu) in enumerate(attempts):
-        if i > 0 and status_cb:
-            mode = "CPU 모드" if gpu == -1 else ("타일 " + str(t))
-            status_cb("결과 비정상 → 재시도 (" + mode + ")")
-        _esrgan_run(src_dir, dst_dir, scale, model, t, gpu, progress_cb, total)
-        if not _outputs_black(dst_dir):
-            return
-    raise RuntimeError("업스케일 결과가 계속 검게 나옵니다 (VRAM/GPU 문제, CPU 모드까지 실패).")
+    # 결과가 전부 검으면(= 해당 GPU가 처리 실패) 다음 GPU로 자동 폴백
+    last = (0, 0)
+    for gi, g in enumerate(gpus):
+        if gi > 0 and status_cb:
+            status_cb("결과 전부 검음 → 다른 GPU로 재시도 (GPU " + str(g) + ")")
+        _esrgan_run(src_dir, dst_dir, scale, model, tile, g, progress_cb, total)
+        nb, nt = _count_black(dst_dir)
+        last = (nb, nt)
+        if nb < nt:  # 일부만 검으면(=정상 검은 페이지) 통과
+            return g
+    raise RuntimeError("모든 GPU에서 업스케일 결과가 전부 검게 나옵니다 (" + str(last[0]) + "/" +
+                       str(last[1]) + "장). exe가 이 GPU와 호환되지 않을 수 있습니다 — "
+                       "realesrgan-ncnn-vulkan을 최신 버전으로 교체해 보세요.")
 
 
 class App(tk.Tk):
@@ -115,6 +175,8 @@ class App(tk.Tk):
         self.title("이미지 → PDF 변환기")
         self.resizable(True, True)
         self.geometry("700x710")
+        self._gpus = list_gpus()
+        self._working_gpu = None
         self._build_ui()
         self._q = queue.Queue()
 
@@ -191,6 +253,28 @@ class App(tk.Tk):
         self.tile_cb.pack(side="left")
         tk.Label(row2, text="(깨지면 낮추기, 0=자동)", fg="gray").pack(side="left", padx=2)
 
+        row3 = tk.Frame(upscale_frame)
+        row3.pack(fill="x", padx=4, pady=(4, 0))
+        tk.Label(row3, text="GPU:").pack(side="left", padx=(0, 2))
+        if self._gpus:
+            gpu_values = [str(n) + ": " + nm for n, nm in self._gpus]
+            default_dev = default_gpu(self._gpus)
+            default_str = next((v for v in gpu_values if v.startswith(str(default_dev) + ":")), "")
+            gpu_state = "readonly"
+            gpu_hint = ""
+        else:
+            # 자동 감지 실패 → 번호 직접 입력 (0=보통 내장, 1=보통 외장)
+            gpu_values = ["0", "1", "2"]
+            default_str = "1"
+            gpu_state = "normal"
+            gpu_hint = "자동 감지 실패 — GPU 번호 직접 선택/입력 (1=보통 외장)"
+        self.gpu_var = tk.StringVar(value=default_str)
+        self.gpu_cb = ttk.Combobox(row3, textvariable=self.gpu_var,
+                                   values=gpu_values, width=42, state=gpu_state)
+        self.gpu_cb.pack(side="left")
+        if gpu_hint:
+            tk.Label(row3, text=gpu_hint, fg="gray").pack(side="left", padx=4)
+
         exe_status = "감지됨" if ESRGAN_EXE.exists() else "exe 없음 -- 프로그램과 같은 폴더에 넣어주세요"
         tk.Label(upscale_frame, text=exe_status,
                  fg="green" if ESRGAN_EXE.exists() else "red").pack(anchor="w", padx=4)
@@ -222,6 +306,14 @@ class App(tk.Tk):
         self.scale_cb.config(state=state)
         self.model_cb.config(state=state)
         self.tile_cb.config(state=state)
+        self.gpu_cb.config(state=state)
+
+    def _selected_gpu(self):
+        s = self.gpu_var.get()
+        try:
+            return int(s.split(":")[0])
+        except (ValueError, IndexError):
+            return None
 
     def _add_images(self):
         paths = filedialog.askopenfilenames(
@@ -276,10 +368,23 @@ class App(tk.Tk):
 
     def _get_upscaled_images(self, src_dir, tmp_root):
         tmp_out = tmp_root / src_dir.name
-        upscale_folder(src_dir, tmp_out, int(self.scale_var.get()), self.model_var.get(),
-                       int(self.tile_var.get()),
-                       lambda d, t: self._q.put(("chapter", (d, t))),
-                       lambda m: self._q.put(("status", m)))
+        # 시도 순서: 직전에 성공한 GPU(있으면) → 사용자가 고른 GPU → 나머지 GPU들
+        sel = self._working_gpu if self._working_gpu is not None else self._selected_gpu()
+        order = []
+        if sel is not None:
+            order.append(sel)
+        for n, _ in self._gpus:
+            if n != sel:
+                order.append(n)
+        if not order:
+            order = [None]
+        used = upscale_folder(src_dir, tmp_out, int(self.scale_var.get()), self.model_var.get(),
+                              int(self.tile_var.get()),
+                              lambda d, t: self._q.put(("chapter", (d, t))),
+                              lambda m: self._q.put(("status", m)),
+                              gpus=order)
+        if used is not None:
+            self._working_gpu = used
         return sorted([p for p in tmp_out.iterdir() if p.suffix.lower() in SUPPORTED])
 
     def _convert(self):
@@ -292,6 +397,20 @@ class App(tk.Tk):
         if not ordered_iids:
             messagebox.showwarning("경고", "변환할 항목이 없습니다.")
             return
+
+        if self.upscale_var.get():
+            model = self.model_var.get()
+            scale = int(self.scale_var.get())
+            allowed = MODEL_SCALES.get(model)
+            if allowed and scale not in allowed:
+                messagebox.showerror(
+                    "모델·배율 불일치",
+                    "'" + model + "' 모델은 배율 " + str(allowed) + " 만 지원합니다.\n"
+                    "현재 배율: " + str(scale) + "\n\n"
+                    "배율을 바꾸거나 다른 모델을 선택하세요.\n"
+                    "(2배를 쓰려면 realesr-animevideov3 모델을 선택하세요.)"
+                )
+                return
 
         image_paths = []
         folder_items = []
@@ -367,6 +486,17 @@ class App(tk.Tk):
                         errors.append("실패 " + folder.name + ": " + str(e))
                     done += 1
                     self._q.put(("progress", done))
+
+            if errors:
+                try:
+                    log_file = out_dir / "변환_실패_로그.txt"
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        f.write("=== " + time.strftime("%Y-%m-%d %H:%M:%S") + " ===\n")
+                        for e in errors:
+                            f.write(e + "\n")
+                        f.write("\n")
+                except Exception:
+                    pass
 
             self._q.put(("done", (results, errors)))
 
