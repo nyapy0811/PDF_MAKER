@@ -6,10 +6,12 @@
 - Real-ESRGAN 업스케일 지원 (realesrgan-ncnn-vulkan.exe 필요)
 """
 
+import json
 import queue
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -40,6 +42,10 @@ def _find_exe():
 ESRGAN_EXE = _find_exe()
 # upscayl-bin은 옵션 체계가 다름: -s=출력배율, -z=모델배율, GPU 목록은 -v 필요
 IS_UPSCAYL = ESRGAN_EXE.name.lower() == "upscayl-bin.exe"
+
+# PyTorch(CUDA) 백엔드: upscale_torch.py가 있으면 우선 사용 (최신 NVIDIA GPU 지원)
+TORCH_SCRIPT = _SCRIPT_DIR / "upscale_torch.py"
+USE_TORCH = TORCH_SCRIPT.exists()
 
 ESRGAN_MODELS = ["realesrgan-x4plus-anime", "realesrgan-x4plus", "realesr-animevideov3"]
 
@@ -100,12 +106,18 @@ def default_gpu(gpus):
 def _esrgan_run(src_dir, dst_dir, scale, model, tile, gpu, progress_cb, total):
     for p in dst_dir.glob("*.png"):
         p.unlink()
-    cmd = [str(ESRGAN_EXE), "-i", str(src_dir), "-o", str(dst_dir),
-           "-m", str(MODELS_DIR), "-n", model, "-s", str(scale), "-f", "png", "-t", str(tile)]
-    if IS_UPSCAYL:
-        cmd += ["-z", str(scale)]  # upscayl: 모델 배율 명시
-    if gpu is not None:
-        cmd += ["-g", str(gpu)]
+    if USE_TORCH:
+        cmd = [sys.executable, str(TORCH_SCRIPT), "-i", str(src_dir), "-o", str(dst_dir),
+               "-m", str(MODELS_DIR), "-n", model, "-s", str(scale), "-t", str(tile)]
+        if gpu is not None:
+            cmd += ["-g", str(gpu)]
+    else:
+        cmd = [str(ESRGAN_EXE), "-i", str(src_dir), "-o", str(dst_dir),
+               "-m", str(MODELS_DIR), "-n", model, "-s", str(scale), "-f", "png", "-t", str(tile)]
+        if IS_UPSCAYL:
+            cmd += ["-z", str(scale)]  # upscayl: 모델 배율 명시
+        if gpu is not None:
+            cmd += ["-g", str(gpu)]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     log_path = dst_dir / "_esrgan.log"
     with open(log_path, "w", encoding="utf-8", errors="ignore") as errf:
@@ -142,7 +154,7 @@ def _count_black(dst_dir):
 
 
 def upscale_folder(src_dir, dst_dir, scale, model, tile=0, progress_cb=None, status_cb=None, gpus=None):
-    if not ESRGAN_EXE.exists():
+    if not USE_TORCH and not ESRGAN_EXE.exists():
         raise FileNotFoundError(
             "realesrgan-ncnn-vulkan.exe 를 찾을 수 없습니다.\n"
             "exe 파일을 프로그램과 같은 폴더에 넣어주세요:\n"
@@ -169,14 +181,70 @@ def upscale_folder(src_dir, dst_dir, scale, model, tile=0, progress_cb=None, sta
                        "realesrgan-ncnn-vulkan을 최신 버전으로 교체해 보세요.")
 
 
+class TorchUpscaler:
+    """upscale_torch.py를 --server 모드로 한 번만 띄워 재사용한다.
+    화마다의 파이썬/CUDA/모델 초기화 비용을 제거해 배치 처리를 빠르게 한다."""
+
+    def __init__(self):
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self.proc = subprocess.Popen(
+            [sys.executable, str(TORCH_SCRIPT), "--server"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="ignore", creationflags=flags)
+        ready = self.proc.stdout.readline()
+        if "READY" not in (ready or ""):
+            raise RuntimeError("PyTorch 업스케일 서버 시작 실패")
+
+    def upscale(self, src, dst, model, scale, tile, progress_cb):
+        dst.mkdir(parents=True, exist_ok=True)
+        for p in dst.glob("*.png"):
+            p.unlink()
+        total = len([p for p in src.iterdir() if p.suffix.lower() in SUPPORTED])
+        req = json.dumps({"i": str(src), "o": str(dst), "m": str(MODELS_DIR),
+                          "n": model, "s": scale, "t": tile})
+        self.proc.stdin.write(req + "\n")
+        self.proc.stdin.flush()
+        result = {}
+
+        def reader():
+            result["line"] = self.proc.stdout.readline()
+
+        th = threading.Thread(target=reader, daemon=True)
+        th.start()
+        while th.is_alive():
+            if progress_cb and total:
+                done = len([p for p in dst.iterdir() if p.suffix.lower() == ".png"])
+                progress_cb(min(done, total), total)
+            time.sleep(0.3)
+        if progress_cb and total:
+            progress_cb(total, total)
+        line = (result.get("line") or "").strip()
+        if line.startswith("ERR"):
+            raise RuntimeError(line[3:].strip("\t ") or "업스케일 실패")
+        if not line:
+            raise RuntimeError("업스케일 서버 응답 없음 (프로세스가 종료됨)")
+
+    def close(self):
+        try:
+            self.proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+            self.proc.stdin.flush()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except Exception:
+            self.proc.kill()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("이미지 → PDF 변환기")
         self.resizable(True, True)
         self.geometry("700x710")
-        self._gpus = list_gpus()
+        self._gpus = [] if USE_TORCH else list_gpus()
         self._working_gpu = None
+        self._torch = None
         self._build_ui()
         self._q = queue.Queue()
 
@@ -239,24 +307,36 @@ class App(tk.Tk):
 
         tk.Label(row1, text="모델:").pack(side="left", padx=(10, 2))
         self.model_var = tk.StringVar(value="realesr-animevideov3")
+        model_values = (["realesr-animevideov3", "realesrgan-x4plus-anime"]
+                        if USE_TORCH else ESRGAN_MODELS)
         self.model_cb = ttk.Combobox(row1, textvariable=self.model_var,
-                                     values=ESRGAN_MODELS, width=28, state="readonly")
+                                     values=model_values, width=28, state="readonly")
         self.model_cb.pack(side="left", padx=4)
 
         row2 = tk.Frame(upscale_frame)
         row2.pack(fill="x", padx=4, pady=(4, 0))
 
         tk.Label(row2, text="타일:").pack(side="left", padx=(0, 2))
-        self.tile_var = tk.StringVar(value="64")
+        tile_default = "64"
+        tile_values = (["768", "512", "384", "256", "128", "64"] if USE_TORCH
+                       else ["0", "400", "200", "100", "64"])
+        self.tile_var = tk.StringVar(value=tile_default)
         self.tile_cb = ttk.Combobox(row2, textvariable=self.tile_var,
-                                    values=["0", "400", "200", "100", "64"], width=5, state="readonly")
+                                    values=tile_values, width=5, state="readonly")
         self.tile_cb.pack(side="left")
-        tk.Label(row2, text="(깨지면 낮추기, 0=자동)", fg="gray").pack(side="left", padx=2)
+        tile_hint = ("(낮을수록 VRAM↓, 약간 느려짐)" if USE_TORCH
+                     else "(깨지면 낮추기, 0=자동)")
+        tk.Label(row2, text=tile_hint, fg="gray").pack(side="left", padx=2)
 
         row3 = tk.Frame(upscale_frame)
         row3.pack(fill="x", padx=4, pady=(4, 0))
         tk.Label(row3, text="GPU:").pack(side="left", padx=(0, 2))
-        if self._gpus:
+        if USE_TORCH:
+            gpu_values = []
+            default_str = "CUDA 자동 (NVIDIA)"
+            gpu_state = "disabled"
+            gpu_hint = ""
+        elif self._gpus:
             gpu_values = [str(n) + ": " + nm for n, nm in self._gpus]
             default_dev = default_gpu(self._gpus)
             default_str = next((v for v in gpu_values if v.startswith(str(default_dev) + ":")), "")
@@ -275,9 +355,14 @@ class App(tk.Tk):
         if gpu_hint:
             tk.Label(row3, text=gpu_hint, fg="gray").pack(side="left", padx=4)
 
-        exe_status = "감지됨" if ESRGAN_EXE.exists() else "exe 없음 -- 프로그램과 같은 폴더에 넣어주세요"
+        if USE_TORCH:
+            exe_status, exe_ok = "PyTorch(CUDA) 백엔드 사용", True
+        elif ESRGAN_EXE.exists():
+            exe_status, exe_ok = "감지됨: " + ESRGAN_EXE.name, True
+        else:
+            exe_status, exe_ok = "exe 없음 -- 프로그램과 같은 폴더에 넣어주세요", False
         tk.Label(upscale_frame, text=exe_status,
-                 fg="green" if ESRGAN_EXE.exists() else "red").pack(anchor="w", padx=4)
+                 fg="green" if exe_ok else "red").pack(anchor="w", padx=4)
 
         # ── 진행도 ──────────────────────────────────
         prog_frame = tk.Frame(self, pady=4)
@@ -306,7 +391,7 @@ class App(tk.Tk):
         self.scale_cb.config(state=state)
         self.model_cb.config(state=state)
         self.tile_cb.config(state=state)
-        self.gpu_cb.config(state=state)
+        self.gpu_cb.config(state="disabled" if USE_TORCH else state)
 
     def _selected_gpu(self):
         s = self.gpu_var.get()
@@ -368,23 +453,30 @@ class App(tk.Tk):
 
     def _get_upscaled_images(self, src_dir, tmp_root):
         tmp_out = tmp_root / src_dir.name
-        # 시도 순서: 직전에 성공한 GPU(있으면) → 사용자가 고른 GPU → 나머지 GPU들
-        sel = self._working_gpu if self._working_gpu is not None else self._selected_gpu()
-        order = []
-        if sel is not None:
-            order.append(sel)
-        for n, _ in self._gpus:
-            if n != sel:
-                order.append(n)
-        if not order:
-            order = [None]
-        used = upscale_folder(src_dir, tmp_out, int(self.scale_var.get()), self.model_var.get(),
-                              int(self.tile_var.get()),
-                              lambda d, t: self._q.put(("chapter", (d, t))),
-                              lambda m: self._q.put(("status", m)),
-                              gpus=order)
-        if used is not None:
-            self._working_gpu = used
+        if USE_TORCH:
+            if self._torch is None:
+                self._torch = TorchUpscaler()
+            self._torch.upscale(src_dir, tmp_out, self.model_var.get(),
+                                int(self.scale_var.get()), int(self.tile_var.get()),
+                                lambda d, t: self._q.put(("chapter", (d, t))))
+        else:
+            # 시도 순서: 직전에 성공한 GPU(있으면) → 사용자가 고른 GPU → 나머지 GPU들
+            sel = self._working_gpu if self._working_gpu is not None else self._selected_gpu()
+            order = []
+            if sel is not None:
+                order.append(sel)
+            for n, _ in self._gpus:
+                if n != sel:
+                    order.append(n)
+            if not order:
+                order = [None]
+            used = upscale_folder(src_dir, tmp_out, int(self.scale_var.get()), self.model_var.get(),
+                                  int(self.tile_var.get()),
+                                  lambda d, t: self._q.put(("chapter", (d, t))),
+                                  lambda m: self._q.put(("status", m)),
+                                  gpus=order)
+            if used is not None:
+                self._working_gpu = used
         return sorted([p for p in tmp_out.iterdir() if p.suffix.lower() in SUPPORTED])
 
     def _convert(self):
@@ -398,7 +490,7 @@ class App(tk.Tk):
             messagebox.showwarning("경고", "변환할 항목이 없습니다.")
             return
 
-        if self.upscale_var.get():
+        if self.upscale_var.get() and not USE_TORCH:
             model = self.model_var.get()
             scale = int(self.scale_var.get())
             allowed = MODEL_SCALES.get(model)
@@ -486,6 +578,10 @@ class App(tk.Tk):
                         errors.append("실패 " + folder.name + ": " + str(e))
                     done += 1
                     self._q.put(("progress", done))
+
+            if self._torch is not None:
+                self._torch.close()
+                self._torch = None
 
             if errors:
                 try:
