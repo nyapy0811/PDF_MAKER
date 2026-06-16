@@ -13,6 +13,7 @@ RTX 50시리즈(Blackwell) 등 최신 NVIDIA GPU 지원.
 import argparse
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -71,10 +72,15 @@ def upscale_tensor(model, img, native_scale, tile, overlap, device):
     return out / weight.clamp(min=1)
 
 
-def process_image(model, native_scale, src, dst, out_scale, tile, overlap, device):
-    img = Image.open(src).convert("RGB")
-    w, h = img.size
-    t = torch.from_numpy(np.asarray(img)).permute(2, 0, 1).unsqueeze(0).float().div(255).to(device)
+def load_image(src):
+    """디스크에서 디코딩해 numpy(HWC, uint8) 반환. 백그라운드 프리페치용."""
+    return np.asarray(Image.open(src).convert("RGB"))
+
+
+def infer_from_array(model, native_scale, np_img, out_scale, tile, overlap, device):
+    """디코딩된 배열을 받아 GPU 추론 → 결과 배열(numpy) 반환."""
+    h, w = np_img.shape[:2]
+    t = torch.from_numpy(np_img).permute(2, 0, 1).unsqueeze(0).float().div(255).to(device)
     sr = upscale_tensor(model, t, native_scale, tile, overlap, device)
     # 원하는 출력 배율로 리사이즈 (예: 4배 모델 → 2배 출력)
     target_h, target_w = h * out_scale, w * out_scale
@@ -82,11 +88,23 @@ def process_image(model, native_scale, src, dst, out_scale, tile, overlap, devic
         mode = "area" if target_h < sr.shape[2] else "bicubic"
         sr = F.interpolate(sr, size=(target_h, target_w), mode=mode,
                            align_corners=False if mode == "bicubic" else None).clamp(0, 1)
-    arr = (sr.squeeze(0).permute(1, 2, 0).mul(255).round().byte().cpu().numpy())
-    Image.fromarray(arr).save(dst)
+    arr = sr.squeeze(0).permute(1, 2, 0).mul(255).round().byte().cpu().numpy()
     if device == "cuda":
         del t, sr
-        torch.cuda.empty_cache()
+    return arr
+
+
+def infer_image(model, native_scale, src, out_scale, tile, overlap, device):
+    return infer_from_array(model, native_scale, load_image(src),
+                            out_scale, tile, overlap, device)
+
+
+def save_png(arr, dst):
+    Image.fromarray(arr).save(dst, compress_level=1)  # 빠른 인코딩(임시 파일이라 용량 무관)
+
+
+def process_image(model, native_scale, src, dst, out_scale, tile, overlap, device):
+    save_png(infer_image(model, native_scale, src, out_scale, tile, overlap, device), dst)
 
 
 def _process_folder(model, native_scale, inp, outp, out_scale, tile, device):
@@ -94,9 +112,27 @@ def _process_folder(model, native_scale, inp, outp, out_scale, tile, device):
     tile = tile if tile and tile > 0 else 512
     overlap = min(32, tile // 4)  # 작은 타일이면 오버랩도 줄여 효율 유지
     files = sorted(p for p in inp.iterdir() if p.suffix.lower() in SUPPORTED)
-    for p in files:
-        process_image(model, native_scale, p, outp / (p.stem + ".png"),
-                      out_scale, tile, overlap, device)
+    # 파이프라인: 로딩(디코딩)·저장(인코딩)을 백그라운드로, GPU 추론만 순차.
+    # GPU가 디스크 입출력을 기다리지 않게 하여 처리량을 높인다.
+    load_ex = ThreadPoolExecutor(max_workers=2)
+    save_ex = ThreadPoolExecutor(max_workers=3)
+    loads = {i: load_ex.submit(load_image, files[i]) for i in range(min(2, len(files)))}
+    saves = []
+    try:
+        for i, p in enumerate(files):
+            np_img = loads.pop(i).result()           # 미리 디코딩된 다음 장
+            j = i + 2
+            if j < len(files):
+                loads[j] = load_ex.submit(load_image, files[j])  # 두 장 앞을 미리 디코딩
+            arr = infer_from_array(model, native_scale, np_img, out_scale, tile, overlap, device)
+            saves.append(save_ex.submit(save_png, arr, outp / (p.stem + ".png")))
+            while len(saves) >= 3:                     # 저장 백프레셔(메모리 제한)
+                saves.pop(0).result()
+        for f in saves:
+            f.result()
+    finally:
+        load_ex.shutdown(wait=True)
+        save_ex.shutdown(wait=True)
 
 
 def run_server():

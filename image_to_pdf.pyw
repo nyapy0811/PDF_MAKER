@@ -7,6 +7,7 @@
 """
 
 import json
+import os
 import queue
 import re
 import shutil
@@ -65,6 +66,136 @@ def images_to_pdf(image_paths, output_path):
     if not imgs:
         raise ValueError("이미지가 없습니다.")
     imgs[0].save(output_path, save_all=True, append_images=imgs[1:])
+
+
+# ───────────────────── 만화 폴더 정리기 로직 ─────────────────────
+ORG_IMG_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+ORG_SPLIT_RE = re.compile(r"^(\d+)-(\d+)_")   # 분할 폴더: NNNN-PP_제목
+ORG_MAIN_RE = re.compile(r"^(\d+(?:\.\d+)?)_")  # 단일/외전 폴더: NNNN_제목, NNNN.M_제목
+
+
+def _org_is_image(name):
+    return name.lower().endswith(ORG_IMG_EXT)
+
+
+def organize_plan(root, series, side_start):
+    """실제 변경 없이 작업 계획(merges, side, renames)을 산출."""
+    entries = [e for e in os.listdir(root) if os.path.isdir(os.path.join(root, e))]
+
+    groups = {}   # base -> [(part_int, folder)]
+    singles = []
+    for name in entries:
+        m = ORG_SPLIT_RE.match(name)
+        if m:
+            base, part = m.group(1), int(m.group(2))
+            groups.setdefault(base, []).append((part, name))
+        elif ORG_MAIN_RE.match(name):
+            singles.append(name)
+
+    merges = []
+    sides = []
+    bases_with_side = set()
+    for base, parts in groups.items():
+        parts.sort()
+        main_parts = [(p, f) for p, f in parts if p < side_start]
+        side_parts = [(p, f) for p, f in parts if p >= side_start]
+        if main_parts:
+            merges.append((base, [f for _, f in main_parts]))
+        for p, f in side_parts:
+            sides.append((base + "." + str(p) + "_" + series, f))
+            bases_with_side.add(base)
+
+    merged_targets = {}
+    for base, _ in merges:
+        suffix = ".0" if base in bases_with_side else ""
+        merged_targets[base] = base + suffix + "_" + series
+
+    rename = []
+    for name in singles:
+        base = ORG_MAIN_RE.match(name).group(1)
+        suffix = ".0" if base in bases_with_side else ""
+        new = base + suffix + "_" + series
+        if new != name:
+            rename.append((name, new))
+
+    return merges, merged_targets, sides, rename
+
+
+def organize_run(root, series, side_start, dry, log):
+    merges, merged_targets, sides, rename = organize_plan(root, series, side_start)
+
+    if merges:
+        log("■ 분할 합치기 (" + str(len(merges)) + "건)")
+    for base, sources in merges:
+        target = merged_targets[base]
+        tpath = os.path.join(root, target)
+        log("    " + ", ".join(sources))
+        log("        →  " + target)
+        if dry:
+            continue
+        os.makedirs(tpath, exist_ok=True)
+        n = 1
+        for src in sources:
+            spath = os.path.join(root, src)
+            files = sorted(f for f in os.listdir(spath) if _org_is_image(f))
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                dest = os.path.join(tpath, "%03d%s" % (n, ext))
+                while os.path.exists(dest):
+                    n += 1
+                    dest = os.path.join(tpath, "%03d%s" % (n, ext))
+                try:
+                    shutil.move(os.path.join(spath, f), dest)
+                except OSError as e:
+                    log("        ! 이동 실패 " + f + ": " + str(e))
+                n += 1
+            try:
+                if src != target:
+                    os.rmdir(spath)
+            except OSError as e:
+                log("   ! 빈 폴더 삭제 실패: " + src + " (" + str(e) + ")")
+
+    if sides:
+        log("")
+        log("■ 외전 이름변경 (" + str(len(sides)) + "건)")
+    for new, src in sides:
+        log("    " + src)
+        log("        →  " + new)
+        if dry:
+            continue
+        sp, np_ = os.path.join(root, src), os.path.join(root, new)
+        if sp == np_:
+            continue
+        if os.path.exists(np_):
+            log("        ! 건너뜀: 대상이 이미 존재함")
+            continue
+        try:
+            os.rename(sp, np_)
+        except OSError as e:
+            log("        ! 실패: " + str(e))
+
+    if rename:
+        log("")
+        log("■ 시리즈명 통일 (" + str(len(rename)) + "건)")
+    for old, new in rename:
+        log("    " + old)
+        log("        →  " + new)
+        if dry:
+            continue
+        op, npth = os.path.join(root, old), os.path.join(root, new)
+        if os.path.exists(npth):
+            log("        ! 건너뜀: 대상이 이미 존재함")
+            continue
+        try:
+            os.rename(op, npth)
+        except OSError as e:
+            log("        ! 실패: " + str(e))
+
+    total = len(merges) + len(sides) + len(rename)
+    log("")
+    log(("[미리보기] " if dry else "") + "처리 대상 " + str(total) + "건 "
+        "(합치기 " + str(len(merges)) + ", 외전 " + str(len(sides)) +
+        ", 이름변경 " + str(len(rename)) + ")")
 
 
 def list_gpus():
@@ -239,17 +370,25 @@ class TorchUpscaler:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("이미지 → PDF 변환기")
+        self.title("만화 도구 — PDF 변환 / 폴더 정리")
         self.resizable(True, True)
-        self.geometry("700x710")
+        self.geometry("720x760")
         self._gpus = [] if USE_TORCH else list_gpus()
         self._working_gpu = None
         self._torch = None
-        self._build_ui()
         self._q = queue.Queue()
 
-    def _build_ui(self):
-        btn_frame = tk.Frame(self, pady=6)
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True)
+        pdf_tab = ttk.Frame(nb)
+        org_tab = ttk.Frame(nb)
+        nb.add(pdf_tab, text="이미지 → PDF")
+        nb.add(org_tab, text="폴더 정리")
+        self._build_ui(pdf_tab)
+        self._build_organizer(org_tab)
+
+    def _build_ui(self, parent):
+        btn_frame = tk.Frame(parent, pady=6)
         btn_frame.pack(fill="x", padx=10)
 
         tk.Button(btn_frame, text="이미지 추가", width=14, command=self._add_images).pack(side="left", padx=3)
@@ -258,7 +397,7 @@ class App(tk.Tk):
         tk.Button(btn_frame, text="위로", width=8, command=self._move_up).pack(side="left", padx=2)
         tk.Button(btn_frame, text="아래로", width=8, command=self._move_down).pack(side="left", padx=2)
 
-        list_frame = tk.Frame(self)
+        list_frame = tk.Frame(parent)
         list_frame.pack(fill="both", expand=True, padx=10)
 
         cols = ("type", "name", "path")
@@ -275,21 +414,21 @@ class App(tk.Tk):
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        out_frame = tk.Frame(self, pady=6)
+        out_frame = tk.Frame(parent, pady=6)
         out_frame.pack(fill="x", padx=10)
         tk.Label(out_frame, text="저장 폴더:").pack(side="left")
         self.out_var = tk.StringVar(value=DEFAULT_SAVE_DIR)
         tk.Entry(out_frame, textvariable=self.out_var, width=45).pack(side="left", padx=4)
         tk.Button(out_frame, text="찾기", command=self._pick_out_dir).pack(side="left")
 
-        name_frame = tk.Frame(self, pady=2)
+        name_frame = tk.Frame(parent, pady=2)
         name_frame.pack(fill="x", padx=10)
         tk.Label(name_frame, text="PDF 파일명 (이미지 모드):").pack(side="left")
         self.pdf_name_var = tk.StringVar(value="output")
         tk.Entry(name_frame, textvariable=self.pdf_name_var, width=24).pack(side="left", padx=4)
         tk.Label(name_frame, text=".pdf").pack(side="left")
 
-        upscale_frame = tk.LabelFrame(self, text="업스케일 (Real-ESRGAN)", pady=6)
+        upscale_frame = tk.LabelFrame(parent, text="업스케일 (Real-ESRGAN)", pady=6)
         upscale_frame.pack(fill="x", padx=10, pady=(4, 0))
 
         row1 = tk.Frame(upscale_frame)
@@ -318,7 +457,7 @@ class App(tk.Tk):
 
         tk.Label(row2, text="타일:").pack(side="left", padx=(0, 2))
         tile_default = "64"
-        tile_values = (["768", "512", "384", "256", "128", "64"] if USE_TORCH
+        tile_values = (["1024", "768", "512", "384", "256", "128", "64"] if USE_TORCH
                        else ["0", "400", "200", "100", "64"])
         self.tile_var = tk.StringVar(value=tile_default)
         self.tile_cb = ttk.Combobox(row2, textvariable=self.tile_var,
@@ -365,7 +504,7 @@ class App(tk.Tk):
                  fg="green" if exe_ok else "red").pack(anchor="w", padx=4)
 
         # ── 진행도 ──────────────────────────────────
-        prog_frame = tk.Frame(self, pady=4)
+        prog_frame = tk.Frame(parent, pady=4)
         prog_frame.pack(fill="x", padx=10)
 
         status_row = tk.Frame(prog_frame)
@@ -379,12 +518,78 @@ class App(tk.Tk):
         self.progress.pack(fill="x", pady=(2, 0))
 
         # ── 변환 버튼 ──────────────────────────────
-        self.convert_btn = tk.Button(self, text="PDF 변환 시작", font=("", 12, "bold"),
+        self.convert_btn = tk.Button(parent, text="PDF 변환 시작", font=("", 12, "bold"),
                                      bg="#2563eb", fg="white", activebackground="#1d4ed8",
                                      pady=6, command=self._convert)
         self.convert_btn.pack(fill="x", padx=10, pady=(2, 10))
 
         self._items = {}
+
+    # ───────────────── 폴더 정리 탭 ─────────────────
+    def _build_organizer(self, parent):
+        frm = ttk.Frame(parent, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="대상 폴더").grid(row=0, column=0, sticky="w")
+        self.org_path = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.org_path, width=60).grid(row=0, column=1, sticky="we", padx=4)
+        ttk.Button(frm, text="찾아보기...", command=self._org_browse).grid(row=0, column=2)
+
+        ttk.Label(frm, text="시리즈명").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.org_series = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.org_series, width=60).grid(row=1, column=1, sticky="we", padx=4, pady=(8, 0))
+        ttk.Label(frm, text="폴더명 자동", foreground="#666").grid(row=1, column=2, sticky="w")
+
+        ttk.Label(frm, text="외전 시작 파트번호").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.org_side = tk.IntVar(value=5)
+        ttk.Spinbox(frm, from_=2, to=20, textvariable=self.org_side, width=6).grid(row=2, column=1, sticky="w", padx=4, pady=(8, 0))
+        ttk.Label(frm, text="(이 번호 이상은 외전 .5/.6 으로 처리)", foreground="#666").grid(row=3, column=1, sticky="w", padx=4)
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=4, column=0, columnspan=3, pady=10, sticky="w")
+        ttk.Button(btns, text="미리보기", command=lambda: self._org_go(True)).pack(side="left")
+        ttk.Button(btns, text="실행", command=lambda: self._org_go(False)).pack(side="left", padx=6)
+
+        self.org_log = tk.Text(frm, height=16, wrap="none")
+        self.org_log.grid(row=5, column=0, columnspan=3, sticky="nsew")
+        sb = ttk.Scrollbar(frm, command=self.org_log.yview)
+        sb.grid(row=5, column=3, sticky="ns")
+        hsb = ttk.Scrollbar(frm, orient="horizontal", command=self.org_log.xview)
+        hsb.grid(row=6, column=0, columnspan=3, sticky="we")
+        self.org_log["yscrollcommand"] = sb.set
+        self.org_log["xscrollcommand"] = hsb.set
+
+        frm.columnconfigure(1, weight=1)
+        frm.rowconfigure(5, weight=1)
+
+    def _org_browse(self):
+        d = filedialog.askdirectory(title="정리할 폴더 선택", initialdir=DEFAULT_OPEN_DIR)
+        if d:
+            self.org_path.set(d)
+            self.org_series.set(os.path.basename(d.rstrip("/\\")))  # 폴더명을 시리즈명으로
+
+    def _org_write(self, s):
+        self.org_log.insert("end", s + "\n")
+        self.org_log.see("end")
+        self.update_idletasks()
+
+    def _org_go(self, dry):
+        root = self.org_path.get().strip()
+        if not root or not os.path.isdir(root):
+            messagebox.showerror("오류", "유효한 폴더를 선택하세요.")
+            return
+        series = self.org_series.get().strip() or os.path.basename(root.rstrip("/\\"))
+        if not series:
+            messagebox.showerror("오류", "시리즈명을 알 수 없습니다 (폴더명 확인).")
+            return
+        if not dry and not messagebox.askyesno(
+                "확인", "실제로 폴더를 변경합니다. 진행할까요?\n(먼저 미리보기로 확인하는 것을 권장)"):
+            return
+        self.org_log.delete("1.0", "end")
+        try:
+            organize_run(root, series, self.org_side.get(), dry, self._org_write)
+        except Exception as e:
+            messagebox.showerror("오류", str(e))
 
     def _toggle_upscale(self):
         state = "readonly" if self.upscale_var.get() else "disabled"
@@ -418,6 +623,10 @@ class App(tk.Tk):
         if not subfolders:
             messagebox.showwarning("경고", parent.name + " 안에 하위 폴더가 없습니다.")
             return
+        # 상위 폴더를 새로 고르면 기존 목록 초기화 후 다시 채움
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        self._items.clear()
         for sub in subfolders:
             self._insert_item("folder", sub, parent_name=parent.name)
 
@@ -599,6 +808,26 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
         self._poll_queue(total)
 
+    def _show_result(self, title, lines):
+        """항목이 많을 때 화면 밖으로 안 나가도록 스크롤 가능한 결과창."""
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.geometry("560x440")
+        ok = len([x for x in lines if x.startswith("OK") or x.startswith("건너뜀")])
+        bad = len(lines) - ok
+        tk.Label(win, text=title + "  —  성공/건너뜀 " + str(ok) + ", 실패 " + str(bad),
+                 anchor="w", pady=4).pack(fill="x", padx=8)
+        tk.Button(win, text="확인", command=win.destroy).pack(side="bottom", pady=6)
+        txt = tk.Text(win, wrap="none")
+        sb = ttk.Scrollbar(win, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 4))
+        txt.insert("end", "\n".join(lines))
+        txt.config(state="disabled")
+        win.transient(self)
+        win.grab_set()
+
     def _poll_queue(self, total):
         try:
             while True:
@@ -619,13 +848,17 @@ class App(tk.Tk):
                     self.progress["value"] = total
                     self.status_var.set("완료!")
                     self.convert_btn.config(state="normal")
-                    msg_text = "\n".join(results + errors)
+                    lines = results + errors
                     if errors and not results:
-                        messagebox.showerror("변환 실패", msg_text)
+                        title, icon = "변환 실패", messagebox.showerror
                     elif errors:
-                        messagebox.showwarning("일부 실패", msg_text)
+                        title, icon = "일부 실패", messagebox.showwarning
                     else:
-                        messagebox.showinfo("완료!", msg_text)
+                        title, icon = "완료!", messagebox.showinfo
+                    if len(lines) <= 12:
+                        icon(title, "\n".join(lines))
+                    else:
+                        self._show_result(title, lines)
                     return
         except queue.Empty:
             pass
